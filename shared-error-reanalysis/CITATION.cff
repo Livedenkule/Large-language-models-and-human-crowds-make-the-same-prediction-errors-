@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite both the software and the paper it accompanies."
+title: "Code for: Large language models and human forecasters make the same prediction errors"
+type: software
+authors:
+  - family-names: "Wilhelmsen"
+    given-names: "Live Leonhardsen"
+    email: "live.l.wilhelmsen@bi.no"
+    affiliation: "Center for Democracy and Information Integrity, BI Norwegian Business School"
+  - family-names: "Esfandiari"
+    given-names: "Roya"
+    affiliation: "Center for Democracy and Information Integrity, BI Norwegian Business School"
+  - family-names: "Gollwitzer"
+    given-names: "Anton"
+    email: "anton.gollwitzer@bi.no"
+    affiliation: "Center for Democracy and Information Integrity, BI Norwegian Business School"
+license: MIT
+repository-code: "https://github.com/USERNAME/shared-error-reanalysis"
+# doi: 10.5281/zenodo.XXXXXXX      # add on Zenodo deposit
+# version: 1.0.0
+# date-released: 2026-XX-XX
+keywords:
+  - forecasting
+  - large language models
+  - metascience
+  - replication
+  - wisdom of crowds
