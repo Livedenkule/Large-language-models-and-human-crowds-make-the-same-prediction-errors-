@@ -1,0 +1,1307 @@
+---
+title: "Shared prediction error in Ashokkumar et al. (2026): the full analysis, explained"
+author: "Live Leonhardsen Wilhelmsen, Roya Esfandiari & Anton Gollwitzer"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+library(dplyr); library(tidyr); library(purrr); library(stringr); library(ggplot2)
+library(patchwork)   # for composing the multi-panel figures
+
+## Resolved from the project root; place the Code Ocean capsule files (9843791)
+## in data/raw/ as described in data/raw/README.md.
+library(here)
+data_dir <- here::here("data", "raw")
+```
+
+# What this document is
+
+This is the complete, self-contained analysis behind our Matters Arising on
+Ashokkumar, Hewitt, Ghezae & Willer, *Large language models can predict the
+results of social science experiments* (Nature, 2026). Every number quoted in
+the commentary and its Supplementary Information is computed here, in order,
+with an explanation of what each step does and why we do it that way.
+
+**The question in one sentence.** The authors show that GPT-4 and a crowd of
+human forecasters each predict experimental results about equally well, and
+suggest the two can be combined because they carry partly independent
+information. We ask about the part they did not analyse: the *errors*. When
+the model is wrong and the crowd is wrong, are they wrong on the same
+experiments, in the same direction? If yes, averaging them cannot fix those
+cases (same-direction errors do not cancel), and their agreement is not
+evidence that a prediction is right.
+
+# The data
+
+Three files from the authors' capsule are used. Nothing here modifies them.
+
+```{r load-data}
+rct <- readRDS(file.path(data_dir, "rct_responses.RDS"))
+llm <- readRDS(file.path(data_dir, "llm_responses.RDS"))
+fc  <- readRDS(file.path(data_dir, "forecasting_responses.RDS"))
+
+c(rct_responses   = sum(map_int(rct$data, nrow)),   # individual survey answers
+  llm_rows        = nrow(llm),                       # one row per model call (7 models)
+  forecast_rows   = nrow(fc),                        # one row per forecaster x condition
+  forecasters     = n_distinct(fc$PROLIFIC_PID))
+
+## descriptive counts referenced in the Supplementary Information
+c(answers_nonmissing = sum(map_int(rct$data, ~sum(!is.na(.x$y)))),
+  studies_raw        = n_distinct(rct$study),
+  study_outcome_cells_raw = nrow(rct),
+  conditions_gpt4    = llm %>% filter(model == "gpt-4") %>%
+                         distinct(study, condition.name) %>% nrow(),
+  possible_pairs     = rct %>% pmap_int(function(data, ...) {
+                         k <- n_distinct(data$condition.name)
+                         as.integer(k * (k - 1) / 2) }) %>% sum(),
+  prompt_cells_240   = llm %>% count(model, study, outcome.name, condition.name) %>%
+                         filter(model == "gpt-4", n == 240) %>% nrow())
+```
+
+*What you are looking at:* `rct_responses` holds the real answers of the
+~120,000 experiment participants — this is the ground truth the predictors are
+trying to guess. `llm_responses` holds every single model call (about 120
+prompts per experimental condition, each prompt a demographic profile, each
+recorded value already the average of five samples). `forecasting_responses`
+holds the human predictions — roughly 30 forecasters per question.
+
+# Step 1 — the observed effects
+
+**What we do.** For every experiment, every outcome and every *pair* of
+conditions, we compute the observed treatment effect: the difference in mean
+response between the two conditions, after rescaling every outcome to run from
+0 to 1 so that different answer scales are comparable. We also keep the
+effect's **standard error** — the experiment's own measure of how precisely it
+pinned that difference down.
+
+**Why a regression?** Running `lm(y ~ condition)` inside each study–outcome is
+just a convenient way to get every condition-versus-reference difference *and*
+its standard error in one step; the coefficient literally equals the difference
+in means. This is exactly what the authors' own pipeline does, so our observed
+effects are theirs.
+
+```{r observed-effects, cache=TRUE}
+## One technical note: we recode condition names to plain ASCII codes before the
+## regression and map back afterwards. Some condition names contain typographic
+## quotes, and on computers with a non-UTF-8 locale R silently rewrites such
+## characters inside coefficient names, which would break the merge with the
+## prediction files. The recode makes the analysis give identical results on
+## any machine.
+rct_effects <- rct %>%
+  pmap_dfr(function(study, outcome.name, outcome.min, outcome.max, data, ...) {
+    d <- data %>% ungroup() %>%
+      mutate(y = (as.numeric(y) - outcome.min) / (outcome.max - outcome.min))
+    conds <- unique(d$condition.name)
+    code  <- setNames(paste0("k", seq_along(conds)), conds)   # safe ASCII level codes
+    d$cc  <- code[d$condition.name]
+    map_dfr(conds, function(ref) {
+      fit <- lm(y ~ cc, data = d %>% mutate(cc = forcats::fct_relevel(cc, code[[ref]])))
+      broom::tidy(fit) %>%
+        transmute(cc = str_match(term, "^cc(k\\d+)$")[, 2], estimate, std.error) %>%
+        filter(!is.na(cc)) %>%
+        mutate(condition.name = names(code)[match(cc, code)],
+               study = study, outcome.name = outcome.name,
+               reference_condition = ref, .before = 1) %>%
+        select(-cc)
+    })
+  })
+```
+
+# Step 2 — the predictions
+
+**The model.** For GPT-4 (and later the six other models), the predicted mean
+of a condition is the **weighted** average of all its prompt-level responses.
+The weights matter: the authors over-sampled some demographic groups so they
+could study subgroups, and the weights undo that over-sampling so the ensemble
+represents the US population — we use their weights exactly. Reversed answer
+scales are un-flipped first, again following their code.
+
+**The crowd.** Each forecaster predicted the average answer of a condition on
+a 0–100 slider; the crowd prediction is the plain mean of those forecasts,
+divided by 100.
+
+**A predicted effect** is then simply: predicted mean of condition A minus
+predicted mean of condition B — the same subtraction the experiment performs
+with real people.
+
+```{r predictions, cache=TRUE}
+llm_means <- llm %>%
+  mutate(expectation = ifelse(scale_flip, outcome_scale_max - (expectation - outcome_scale_min),
+                              expectation),
+         y = (expectation - outcome_scale_min) / (outcome_scale_max - outcome_scale_min)) %>%
+  filter(!is.na(y)) %>%
+  group_by(model, study, outcome.name, condition.name) %>%
+  summarise(pred_mean = weighted.mean(y, w = weight), .groups = "drop")
+
+fc_means <- fc %>%
+  mutate(y = value / 100) %>%
+  semi_join(distinct(llm, study, outcome.name), by = c("study", "outcome.name")) %>%
+  group_by(study, outcome.name, condition.name) %>%
+  summarise(pred_mean = mean(y), .groups = "drop") %>%
+  mutate(model = "human")
+
+cond_means <- bind_rows(llm_means, fc_means)
+
+pred_contrasts <- cond_means %>%
+  group_by(model, study, outcome.name) %>%
+  group_modify(function(d, k) {
+    crossing(d %>% select(condition.name, pred_mean),
+             d %>% select(reference_condition = condition.name, ref_mean = pred_mean)) %>%
+      filter(condition.name != reference_condition) %>%
+      transmute(condition.name, reference_condition, prediction = pred_mean - ref_mean)
+  }) %>%
+  ungroup()
+```
+
+# Step 3 — one row per comparison, and the 'combined' predictor
+
+Comparing A to B and B to A is the same comparison with the sign flipped, so we
+keep each **unordered pair** once. The authors' proposed combination of model
+and crowd is the simple average of the two predictions; we build it the same
+way so we can test it later.
+
+```{r comparisons, cache=TRUE}
+## Deduplication note: comparing strings with '<' depends on the computer's
+## locale — in a plain C locale R even returns NA for names with typographic
+## quotes, silently dropping those comparisons. We therefore order names with a
+## fixed ICU collator (English), which is identical on every machine and
+## matches the orientation of the deposited comparison-level dataset.
+en <- stringi::stri_opts_collator(locale = "en_US")
+comparisons <- rct_effects %>%
+  inner_join(pred_contrasts, by = c("study", "outcome.name", "condition.name", "reference_condition")) %>%
+  filter(stringi::stri_cmp_lt(reference_condition, condition.name, opts_collator = en))
+
+combined <- comparisons %>%
+  filter(model %in% c("gpt-4", "human")) %>%
+  select(study, outcome.name, condition.name, reference_condition, estimate, std.error, model, prediction) %>%
+  pivot_wider(names_from = model, values_from = prediction) %>%
+  filter(!is.na(`gpt-4`), !is.na(human)) %>%
+  mutate(model = "combined", prediction = (`gpt-4` + human) / 2) %>%
+  select(-`gpt-4`, -human)
+
+comparisons <- bind_rows(comparisons, combined)
+```
+
+# Step 4 — how wrong is a prediction? The z-score
+
+**The idea.** A prediction that is 5 points off means nothing in a small noisy
+study and a lot in a big precise one. So we measure each prediction's error in
+units of the observed effect's own standard error:
+
+$$z = \frac{\text{prediction} - \text{observed effect}}{\text{standard error of the observed effect}}$$
+
+If the prediction were perfect and only sampling noise separated it from the
+estimate, z would behave like a standard normal draw: beyond ±1.96 only 5% of
+the time. So **|z| > 1.96 means the prediction sits outside the experiment's
+own 95% confidence interval — the experiment itself is telling us the
+prediction is wrong.** We call that a *miss*.
+
+# Step 5 — recalibration (giving the predictors their best shot)
+
+**Why.** The authors themselves report that predictions overshoot true effects
+by roughly a factor of two, and that a linear rescaling fixes it. If we skipped
+this, a critic could say all our shared misses are just that one shared,
+already-known bias. So we apply *their* remedy before measuring anything.
+
+**How, without cheating.** For each study we fit the rescaling line
+`lm(estimate ~ prediction)` on the *other 69* studies only, then apply it to
+the held-out study — so no study helps correct itself, and every predictor gets
+the same treatment.
+
+**Where this procedure comes from.** To be precise about provenance: this
+leave-one-study-out rescaling is the authors' method for their *pilot-testing*
+use-case, not part of the main correlation analysis they report in the paper.
+We borrow it because it is their own published remedy for the overshooting they
+document, and applying it is the version of the analysis most favourable to the
+predictors. Importantly, the shared error is **not** created by it — it is
+already present in the raw, unrecalibrated predictions (see the robustness
+section: joint misses 27.6%, same-side 20.9%, and an error correlation of 0.39
+before recalibration versus 0.59 after). Recalibration sharpens the picture; it
+does not manufacture it.
+
+```{r recalibration, cache=TRUE}
+comparisons <- comparisons %>%
+  mutate(z_raw = (prediction - estimate) / std.error) %>%
+  group_by(model) %>%
+  group_modify(function(d, k) {
+    d$pred_recal <- NA_real_
+    for (s in unique(d$study)) {
+      fit <- lm(estimate ~ prediction, data = d %>% filter(study != s))
+      d$pred_recal[d$study == s] <- predict(fit, newdata = d %>% filter(study == s))
+    }
+    d
+  }) %>%
+  ungroup() %>%
+  mutate(z_recal = (pred_recal - estimate) / std.error)
+
+## the pooled recalibration lines (the leave-one-study-out fits vary only
+## slightly around these) — intercepts are essentially zero, slopes about 0.5,
+## i.e. both predictors overstate effects by roughly a factor of two.
+comparisons %>%
+  filter(model %in% c("gpt-4", "human")) %>%
+  group_by(model) %>%
+  group_modify(~ broom::tidy(lm(estimate ~ prediction, data = .x))) %>%
+  ungroup() %>%
+  transmute(model, term, estimate = round(estimate, 4))
+
+wide <- comparisons %>%
+  filter(model %in% c("gpt-4", "human", "combined")) %>%
+  select(study, outcome.name, reference_condition, condition.name,
+         estimate, std.error, prediction, model, z_raw, z_recal) %>%
+  pivot_wider(names_from = model, values_from = c(prediction, z_raw, z_recal)) %>%
+  filter(!is.na(`z_recal_gpt-4`), !is.na(z_recal_human)) %>%
+  rename(zg = `z_recal_gpt-4`, zh = z_recal_human, zc = z_recal_combined,
+         pg = `prediction_gpt-4`, ph = prediction_human)
+
+nrow(wide)   # 1,678 — all available comparisons
+```
+
+# The core results
+
+A note on what the 1,678 are: they are **all available comparisons** — every
+pair of conditions within a study and outcome for which both predictors made a
+prediction. They are deliberately not a random or independent sample. Pairs
+within a study share participants and often share a condition, so they overlap;
+this is why every confidence interval below is computed by resampling *studies*
+rather than comparisons, and why we also report study-weighted rates and the
+authors' own sampling scheme as checks.
+
+```{r core}
+miss_g <- abs(wide$zg) > 1.96
+miss_h <- abs(wide$zh) > 1.96
+joint  <- miss_g & miss_h
+same   <- joint & (sign(wide$zg) == sign(wide$zh))
+
+tibble(
+  `GPT-4 miss rate`  = mean(miss_g),
+  `Crowd miss rate`  = mean(miss_h),
+  `Joint misses`     = sum(joint),
+  `Joint rate`       = mean(joint),
+  `Same-side misses` = sum(same),
+  `Same-side rate`   = mean(same),
+  `Direction | joint`= sum(same) / sum(joint)
+) %>% mutate(across(where(is.numeric), ~round(., 3))) %>% as.data.frame()
+
+## the analysis set behind the 1,678, and a rank-based coupling measure
+c(studies = n_distinct(wide$study),
+  study_outcome_cells = wide %>% distinct(study, outcome.name) %>% nrow(),
+  spearman_zg_zh = round(cor(wide$zg, wide$zh, method = "spearman"), 2))
+```
+
+*Reading this:* even after the correction, each predictor misses over a third
+of the time (35.7% and 38.0%). They miss **together** on 339 comparisons
+(20.2%), and on 305 of those (18.2% of everything) they miss **on the same
+side** — both too high, or both too low, relative to what the experiment found.
+Of the comparisons both miss, 90% are same-side.
+
+```{r scatter, fig.width=6, fig.height=5}
+wide %>%
+  mutate(class = case_when(same ~ "Both miss, same side",
+                           joint ~ "Both miss, opposite sides",
+                           TRUE ~ "Other")) %>%
+  ggplot(aes(pmax(pmin(zg, 12), -12), pmax(pmin(zh, 12), -12), colour = class)) +
+  geom_point(size = .8, alpha = .6) +
+  geom_hline(yintercept = c(-1.96, 1.96), linetype = 3) +
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = 3) +
+  scale_colour_manual(values = c("Both miss, same side" = "#c0392b",
+                                 "Both miss, opposite sides" = "#1f6eb2",
+                                 "Other" = "grey75")) +
+  labs(x = "GPT-4 error (standard errors of the observed effect)",
+       y = "Human crowd error", colour = NULL) +
+  theme_minimal()
+```
+
+# Are the errors dependent? A test with no assumptions
+
+**The idea.** Multiply the two errors together, comparison by comparison:
+$w = z_g \times z_h$. When the two err on the same side, w is positive; on
+opposite sides, negative. If the two predictors were unrelated, positives and
+negatives would balance and the average w would be zero. To get the "unrelated"
+benchmark without assuming anything, we simply **shuffle the pairing**: match
+GPT-4's error on one comparison with the crowd's error on a random other
+comparison, 2,000 times. Shuffling destroys any true dependence while keeping
+each predictor's own error distribution exactly as it is.
+
+```{r permutation}
+set.seed(1)
+w_obs <- mean(wide$zg * wide$zh)
+w_perm <- replicate(2000, mean(wide$zg * sample(wide$zh)))
+c(observed = round(w_obs, 2), null_mean = round(mean(w_perm), 3), null_sd = round(sd(w_perm), 3))
+
+per_study <- wide %>% group_by(study) %>% summarise(w = mean(zg * zh))
+c(studies_positive = sum(per_study$w > 0), of = nrow(per_study),
+  wilcoxon_p = wilcox.test(per_study$w)$p.value)
+```
+
+*Reading this:* the observed mean co-error is 3.6 where shuffling gives 0 —
+the errors are strongly dependent. And it is not one weird study: the study-level
+mean is positive in 59 of the 70. The Wilcoxon test makes the point while
+treating the study, not the comparison, as the unit — the conservative choice,
+since comparisons inside a study share participants.
+
+# The corrected null: what would "unrelated" really look like?
+
+**The subtlety.** Both predictors are graded against the *same* estimated
+effect, and that estimate contains sampling noise of its own. When an
+experiment's estimate happens by chance to land unusually high, *every*
+prediction ends up "too low" relative to it — on the same side — through no
+fault of the predictors. So even completely unrelated predictions would show
+some same-side clustering. Naive benchmarks (50% direction; the product of the
+two miss rates) ignore this and would flatter us.
+
+**The fix.** Write each standardized error as $z_i = a_i - u$, where $a_i$ is
+the predictor's own deviation from the *true* effect and $u$ is the estimate's
+standardized sampling noise — the same $u$ for both predictors, with variance
+exactly 1 by construction. We simulate unrelated predictors that share only
+$u$, calibrating each one's spread so its overall miss rate matches the real
+predictor's. What this null produces is the benchmark; whatever the data show
+*beyond* it is genuine dependence between the predictions.
+
+```{r corrected-null, cache=TRUE}
+set.seed(2)
+N <- 2e6
+u <- rnorm(N); bg <- rnorm(N); bh <- rnorm(N)
+calib <- function(b, target)
+  uniroot(function(s) mean(abs(s * b - u) > 1.96) - target, c(0.05, 20))$root
+sg <- calib(bg, mean(miss_g)); sh <- calib(bh, mean(miss_h))
+zgs <- sg * bg - u; zhs <- sh * bh - u
+joint_s <- abs(zgs) > 1.96 & abs(zhs) > 1.96
+same_s  <- joint_s & sign(zgs) == sign(zhs)
+c(null_joint = round(mean(joint_s), 3),
+  null_same  = round(mean(same_s), 3),
+  null_direction = round(mean(sign(zgs[joint_s]) == sign(zhs[joint_s])), 3))
+
+## sanity check: theory says E[z_g z_h] = Var(u) = 1 exactly under this null
+round(mean(zgs * zhs), 3)
+```
+
+*Reading this:* under the corrected null, unrelated predictors would already
+produce **71%** same-side agreement among joint misses (not 50%) and a **10%**
+same-side miss rate (not 6.8%). The observed values — 90% and 18.2% — exceed
+both. That is the honest comparison, and it is the one the commentary reports.
+
+**An exact version.** Under this null the pair of errors is exactly bivariate
+normal, so the benchmarks are one-dimensional integrals and need no simulation
+at all. The function below computes them exactly for any pair of miss rates and
+any threshold; we use it for every benchmark in the Supplementary Information,
+so those numbers carry no simulation noise. It reproduces the simulated values
+above to three decimals.
+
+```{r exact-null}
+null_exact <- function(miss_g, miss_h, t = 1.96) {
+  sig <- function(p) t / qnorm(1 - p / 2)            # total sd that yields this miss rate
+  s2g <- max(sig(miss_g)^2 - 1, 0); s2h <- max(sig(miss_h)^2 - 1, 0)
+  tail_hi <- function(s2, u) if (s2 > 0) pnorm((t + u) / sqrt(s2), lower.tail = FALSE) else as.numeric(-u >  t)
+  tail_lo <- function(s2, u) if (s2 > 0) pnorm((-t + u) / sqrt(s2))                    else as.numeric(-u < -t)
+  f <- function(u, kind) sapply(u, function(uu) {
+    gh <- tail_hi(s2g, uu); gl <- tail_lo(s2g, uu)
+    hh <- tail_hi(s2h, uu); hl <- tail_lo(s2h, uu)
+    v <- if (kind == "joint") (gh + gl) * (hh + hl) else gh * hh + gl * hl
+    v * dnorm(uu)
+  })
+  joint <- integrate(f, -9, 9, kind = "joint", rel.tol = 1e-9, subdivisions = 500L)$value
+  same  <- integrate(f, -9, 9, kind = "same",  rel.tol = 1e-9, subdivisions = 500L)$value
+  c(joint = joint, same = same, direction = same / joint)
+}
+round(100 * null_exact(mean(miss_g), mean(miss_h)), 2)   # matches the simulation above
+```
+
+**Does the null's normality matter?** The predictors' real errors have heavier
+tails than a normal distribution, so we recompute the two decisive benchmarks
+with heavier-tailed error shapes — a Student t with 3 degrees of freedom, and
+the empirical shape of the errors themselves. Both are again computed exactly,
+by integrating over the shared term. Heavier tails make the benchmarks slightly
+*lower*, so the normal case quoted in the commentary is the most conservative.
+
+```{r tail-variants, cache=TRUE}
+null_exact_tail <- function(miss_g, miss_h, t = 1.96, qtail, ptail) {
+  ## ptail(q): upper-tail prob of the standardized error shape; calibrate scale s
+  ## so that P(|s*b - u| > t) matches each predictor's observed miss rate.
+  miss_of <- function(s) integrate(function(u) sapply(u, function(uu)
+      (ptail((t + uu) / s) + ptail((t - uu) / s)) * dnorm(uu)), -9, 9,
+      subdivisions = 500L, stop.on.error = FALSE)$value
+  cal <- function(p) uniroot(function(s) miss_of(s) - p, c(0.05, 30))$root
+  sg <- cal(miss_g); sh <- cal(miss_h)
+  f <- function(u, kind) sapply(u, function(uu) {
+    gh <- ptail((t + uu) / sg); gl <- ptail((t - uu) / sg)
+    hh <- ptail((t + uu) / sh); hl <- ptail((t - uu) / sh)
+    v <- if (kind == "joint") (gh + gl) * (hh + hl) else gh * hh + gl * hl
+    v * dnorm(uu)
+  })
+  joint <- integrate(f, -9, 9, kind = "joint", subdivisions = 500L, stop.on.error = FALSE)$value
+  same  <- integrate(f, -9, 9, kind = "same",  subdivisions = 500L, stop.on.error = FALSE)$value
+  c(same = 100 * same, direction = 100 * same / joint)
+}
+t3p <- function(q) pt(q * sqrt(3), df = 3, lower.tail = FALSE)   # t(3) scaled to unit variance
+eg  <- (wide$zg - mean(wide$zg)) / sd(wide$zg)                   # empirical shapes
+eh  <- (wide$zh - mean(wide$zh)) / sd(wide$zh)
+emp <- function(z) function(q) sapply(q, function(qq) mean(z > qq))
+rbind(
+  `normal`        = 100 * null_exact(mean(miss_g), mean(miss_h))[c("same", "direction")] * c(1, 1),
+  `Student t(3)`  = null_exact_tail(mean(miss_g), mean(miss_h), qtail = NULL, ptail = t3p),
+  `empirical`     = null_exact_tail(mean(miss_g), mean(miss_h), qtail = NULL,
+                                    ptail = function(q) (emp(eg)(q) + emp(eh)(q)) / 2)
+) %>% round(1)
+```
+
+# A fairer benchmark: letting each study set its own difficulty
+
+**The worry.** The corrected null above gives each predictor a single miss rate
+for the whole archive — in effect assuming every study is equally hard to
+predict. But studies plainly differ: some test effects almost anyone would call
+correctly, others are genuinely obscure. If a study is simply *hard*, both
+predictors will miss it more often **even if their errors have nothing to do
+with each other**, and that extra overlap would show up in our numbers as
+"shared error" when it is really just "hard study".
+
+**The fix.** Run exactly the same null, but calibrate the two spreads *within
+each study* to that study's own miss rates, then pool across studies. This
+builds study difficulty into the benchmark itself, so whatever the data show
+above it cannot be explained by some studies being harder than others.
+
+```{r study-specific-null, cache=TRUE}
+set.seed(21)
+POOL   <- 1e6
+pool_b <- rnorm(POOL); pool_u <- rnorm(POOL)
+rate_for <- function(s) mean(abs(s * pool_b - pool_u) > 1.96)
+
+## calibrate the spread s so the simulated miss rate matches a target.
+## Guards: a perfect predictor still "misses" 5% of the time (that is the floor),
+## and we cap the spread at 40 for numerical safety.
+calib_s <- function(target) {
+  if (target <= rate_for(0))  return(0)
+  if (target >= rate_for(40)) return(40)
+  uniroot(function(s) rate_for(s) - target, c(0, 40), tol = 1e-4)$root
+}
+
+REP <- 4000                      # simulated replicates per real comparison
+ss_null <- map_dfr(unique(wide$study), function(k) {
+  m  <- wide$study == k
+  nk <- sum(m)
+  s1 <- calib_s(mean(miss_g[m]))
+  s2 <- calib_s(mean(miss_h[m]))
+  uu <- rnorm(nk * REP); b1 <- rnorm(nk * REP); b2 <- rnorm(nk * REP)
+  z1 <- s1 * b1 - uu; z2 <- s2 * b2 - uu
+  j  <- abs(z1) > 1.96 & abs(z2) > 1.96
+  tibble(n = length(z1), joint = sum(j), same = sum(j & sign(z1) == sign(z2)))
+})
+
+rbind(
+  observed             = c(mean(joint), mean(same), sum(same) / sum(joint)),
+  `global null`        = c(mean(joint_s), mean(same_s),
+                           mean(sign(zgs[joint_s]) == sign(zhs[joint_s]))),
+  `study-specific null`= c(sum(ss_null$joint) / sum(ss_null$n),
+                           sum(ss_null$same)  / sum(ss_null$n),
+                           sum(ss_null$same)  / sum(ss_null$joint))
+) %>% `colnames<-`(c("joint", "same_side", "direction")) %>% round(3)
+```
+
+*Reading this:* the joint-miss benchmark rises from about 14% to about 16%, so
+study difficulty does explain part of the overlap in **which** comparisons get
+missed — roughly a third of the excess. But the same-side benchmark barely
+moves (10.0% to about 10.3%), and the direction benchmark actually *falls*
+(71% to about 64%), so the observed 90% clears it by more than before.
+
+That is exactly the pattern the logic predicts. A hard study makes both
+predictors miss the same *items*, but being hard gives them no reason to miss
+on the same *side*. So the directional result — the one that decides whether
+averaging can help — survives this objection untouched, while the joint-miss
+excess, which we already treated as the weaker of the two, narrows.
+
+One technical caveat: in a few studies a predictor misses so rarely that no
+spread can reproduce its rate (a perfect predictor still lands outside the
+interval 5% of the time by chance). We set the spread to zero there, which
+makes the two simulated predictors perfectly aligned and so *inflates* the
+null — the conservative direction. This affects 4 studies (9 comparisons, with
+zero observed joint misses between them), so it cannot be driving the result.
+
+# How certain are we? Uncertainty that respects the studies
+
+Comparisons inside a study are not independent — they share participants and
+conditions. So instead of pretending we have 1,678 independent observations,
+we bootstrap **studies**: resample the 70 studies with replacement, recompute
+each rate, repeat 4,000 times, and take the middle 95%.
+
+```{r bootstrap, cache=TRUE}
+set.seed(3)
+studies <- unique(wide$study)
+boot <- replicate(4000, {
+  s <- sample(studies, replace = TRUE)
+  d <- map_dfr(s, ~ wide[wide$study == .x, ])
+  jg <- abs(d$zg) > 1.96 & abs(d$zh) > 1.96
+  sm <- jg & sign(d$zg) == sign(d$zh)
+  c(joint = mean(jg), same = mean(sm), dir = sum(sm) / sum(jg))
+})
+apply(boot, 1, quantile, c(.025, .975)) %>% round(3)
+```
+
+*Reading this:* the same-side rate's interval (about 13–24%) clears the 10%
+null, and the direction interval (about 84–95%) clears 71% comfortably. The
+joint-miss interval brushes its 14% null — which is why the commentary calls
+that excess modest and leans on direction.
+
+# Does the excess statistically exceed the null?
+
+**The question.** The corrected null gives the rates unrelated predictors are
+*expected* to produce, but an expectation is not a test: sampling variation
+under the null could in principle reach the observed rates by luck. So we ask
+directly how often it does. Three tests, from three different angles; they
+agree.
+
+**1. Simulate whole archives from the corrected null.** Draw complete
+archives of the same size as ours from the corrected null (the calibrated
+spreads `sg` and `sh` from above), compute the three rates in each, and read
+off the one-sided P — the share of null archives whose rate reaches the
+observed one — together with the null's own 95% range, which the figures use
+as the error bars on the null benchmarks.
+
+```{r exceedance-global, cache=TRUE}
+set.seed(41)
+R_NULL <- 10000
+obs <- c(joint = mean(joint), same_side = mean(same), direction = sum(same) / sum(joint))
+
+null_draw <- function(n) {
+  uu <- rnorm(n)
+  z1 <- sg * rnorm(n) - uu
+  z2 <- sh * rnorm(n) - uu
+  j  <- abs(z1) > 1.96 & abs(z2) > 1.96
+  s  <- j & sign(z1) == sign(z2)
+  c(joint = mean(j), same_side = mean(s),
+    direction = if (sum(j)) sum(s) / sum(j) else NA_real_)
+}
+null_dist <- t(replicate(R_NULL, null_draw(nrow(wide))))
+
+p_mc <- sapply(colnames(null_dist), function(k)
+  (1 + sum(null_dist[, k] >= obs[[k]], na.rm = TRUE)) / (1 + R_NULL))
+null_ci <- apply(null_dist, 2, quantile, c(.025, .975), na.rm = TRUE)
+
+rbind(observed = obs, null_lo = null_ci[1, ], null_hi = null_ci[2, ],
+      P = p_mc) %>% round(4)
+```
+
+**2. The same test against the study-specific null.** The stricter benchmark
+above lets every study set its own difficulty; rebuilding it per replicate
+archive gives it a null *distribution* too, not just a null mean. The
+per-study spreads are calibrated once (with `calib_s` from above) and reused.
+
+```{r exceedance-ss, cache=TRUE}
+set.seed(42)
+R_SS <- 2000
+
+study_tab <- wide %>%
+  group_by(study) %>%
+  summarise(n = n(), mg = mean(abs(zg) > 1.96), mh = mean(abs(zh) > 1.96),
+            .groups = "drop") %>%
+  mutate(s1 = sapply(mg, calib_s), s2 = sapply(mh, calib_s))
+
+ss_draw <- function() {
+  tot <- sum(study_tab$n); jj <- 0L; ss <- 0L
+  for (i in seq_len(nrow(study_tab))) {
+    nk <- study_tab$n[i]
+    uu <- rnorm(nk)
+    z1 <- study_tab$s1[i] * rnorm(nk) - uu
+    z2 <- study_tab$s2[i] * rnorm(nk) - uu
+    j  <- abs(z1) > 1.96 & abs(z2) > 1.96
+    jj <- jj + sum(j); ss <- ss + sum(j & sign(z1) == sign(z2))
+  }
+  c(joint = jj / tot, same_side = ss / tot,
+    direction = if (jj) ss / jj else NA_real_)
+}
+ss_dist <- t(replicate(R_SS, ss_draw()))
+
+p_ss  <- sapply(colnames(ss_dist), function(k)
+  (1 + sum(ss_dist[, k] >= obs[[k]], na.rm = TRUE)) / (1 + R_SS))
+ss_ci <- apply(ss_dist, 2, quantile, c(.025, .975), na.rm = TRUE)
+
+rbind(observed = obs, null_lo = ss_ci[1, ], null_hi = ss_ci[2, ],
+      P = p_ss) %>% round(4)
+```
+
+**3. Invert the study bootstrap.** The two Monte-Carlo tests draw comparisons
+independently, whereas real comparisons cluster within studies. The study
+bootstrap above respects that structure, so as a companion we simply ask how
+often a resampled rate falls at or below the corrected-null benchmark.
+
+```{r exceedance-boot}
+ne <- null_exact(mean(miss_g), mean(miss_h))
+c(P_joint     = mean(boot["joint", ] <= ne[["joint"]]),
+  P_same_side = mean(boot["same", ]  <= ne[["same"]]),
+  P_direction = mean(boot["dir", ]   <= ne[["direction"]], na.rm = TRUE))
+```
+
+*Reading this:* none of the 10,000 corrected-null archives — nor any of the
+2,000 study-specific ones, nor any bootstrap draw — reaches the observed
+same-side rate or direction share, so all three one-sided P values sit below
+the resolution of the simulations (P < 10^-4^, P < 5 × 10^-4^ and P < 2.5 ×
+10^-4^ respectively). The excess is not something sampling variation under
+independence produces. The assumption-free permutation test earlier in this
+document makes the same point from yet another angle.
+
+**Interval helpers used from here on.** Conditional shares ("of GPT-4's
+misses, the share the crowd also missed") get Wilson score intervals; the
+error-on-error slope gets a cluster-robust confidence band, which Fig. 1a
+draws.
+
+```{r interval-helpers}
+wilson_ci <- function(k, n, level = .95) {
+  if (n == 0) return(c(lo = NA_real_, hi = NA_real_))
+  z <- qnorm(1 - (1 - level) / 2); p <- k / n; d <- 1 + z^2 / n
+  c(lo = (p + z^2/(2*n) - z * sqrt(p*(1-p)/n + z^2/(4*n^2))) / d,
+    hi = (p + z^2/(2*n) + z * sqrt(p*(1-p)/n + z^2/(4*n^2))) / d)
+}
+
+cluster_vcov <- function(fit, cluster) {
+  X <- model.matrix(fit); u <- residuals(fit)
+  XtXi <- solve(crossprod(X))
+  meat <- Reduce(`+`, lapply(split(seq_len(nrow(X)), cluster), function(i) {
+    v <- crossprod(X[i, , drop = FALSE], u[i]); tcrossprod(v)
+  }))
+  XtXi %*% meat %*% XtXi
+}
+
+slope_band <- function(x, y, cluster, grid = seq(min(x), max(x), length.out = 200)) {
+  fit <- lm(y ~ x)
+  V   <- cluster_vcov(fit, cluster)
+  G   <- cbind(1, grid)
+  se  <- sqrt(rowSums((G %*% V) * G))
+  yh  <- as.vector(G %*% coef(fit))
+  list(slope = coef(fit)[2], slope_se = sqrt(V[2, 2]),
+       band = tibble(x = grid, fit = yh, lo = yh - 1.96 * se, hi = yh + 1.96 * se))
+}
+```
+
+# Is one big study driving the result? Study-weighted rates
+
+Studies contribute very unequal numbers of comparisons — from 1 to 198 — so the
+headline rates are dominated by the condition-rich studies. The check is to
+recompute them giving each of the 70 studies equal weight.
+
+```{r study-weighted}
+by_study <- wide %>%
+  group_by(study) %>%
+  summarise(n     = n(),
+            joint = mean(abs(zg) > 1.96 & abs(zh) > 1.96),
+            same  = mean(abs(zg) > 1.96 & abs(zh) > 1.96 & sign(zg) == sign(zh)),
+            .groups = "drop")
+
+c(joint_comparison_weighted = mean(joint),
+  joint_study_weighted      = mean(by_study$joint),
+  same_comparison_weighted  = mean(same),
+  same_study_weighted       = mean(by_study$same)) %>% round(3)
+
+range(by_study$n)      # comparisons contributed by the smallest and largest study
+```
+
+*Reading this:* the study-weighted rates are **higher** (about 30% and 25%)
+than the comparison-weighted ones we report (20.2% and 18.2%). So the large,
+condition-rich studies are pulling our headline figures *down*, not up: the
+numbers in the commentary are the conservative choice, and giving every study
+an equal say would strengthen the result rather than weaken it.
+
+# Does averaging actually fail? Their own combined predictor
+
+No assumptions needed here either: the authors propose averaging model and
+crowd, we built that average above and recalibrated it identically — so we can
+just look at how it does on the comparisons in question.
+
+```{r combined}
+tibble(
+  `same-side joint misses: combined also outside CI` =
+    mean(abs(wide$zc[same]) > 1.96),
+  `opposite-side joint misses: combined outside CI` =
+    mean(abs(wide$zc[joint & !same]) > 1.96)
+) %>% round(3)
+```
+
+*Reading this:* where the two miss on opposite sides, averaging works —
+the combined prediction recovers 82% of the time. Where they miss on the same
+side, it stays wrong 95% of the time. Same-side error is precisely the failure
+mode averaging cannot repair, in their own combination.
+
+# Can a different model, or an expert, be the independent check?
+
+```{r crossmodel}
+zwide <- comparisons %>%
+  select(study, outcome.name, reference_condition, condition.name, model, z_recal) %>%
+  pivot_wider(names_from = model, values_from = z_recal)
+
+others <- c("deepseek/deepseek-chat-v3-0324", "openai/gpt-oss-120b", "gpt-3.5-turbo",
+            "google/gemma-3-27b-it", "babbage-002", "davinci-002", "human")
+gp <- zwide$`gpt-4`
+cross_template <- map_dfr(others, function(m) {
+  zo <- zwide[[m]]
+  ok <- !is.na(zo) & !is.na(gp)
+  gmr <- mean(abs(gp[ok]) > 1.96)                     # GPT-4's miss rate on this overlap
+  omr <- mean(abs(zo[ok]) > 1.96)
+  ne  <- null_exact(gmr, omr)                         # exact corrected null for this pair
+  gmiss <- ok & abs(gp) > 1.96
+  k    <- sum((abs(zo) > 1.96 & sign(zo) == sign(gp))[gmiss])
+  ci   <- wilson_ci(k, sum(gmiss))
+  bench <- ne[["same"]] / gmr
+  tibble(predictor = m,
+         miss_rate = omr,
+         n_gpt4_misses = sum(gmiss),
+         also_same_side = k / sum(gmiss),
+         wilson_lo = ci[["lo"]], wilson_hi = ci[["hi"]],
+         null_also_same = bench,
+         P_binomial = pbinom(k - 1, sum(gmiss), bench, lower.tail = FALSE),
+         error_corr = cor(gp[ok], zo[ok]))
+})
+cross_template %>%
+  mutate(across(c(miss_rate, also_same_side, wilson_lo, wilson_hi,
+                  null_also_same, error_corr), ~round(., 2)),
+         P_binomial = signif(P_binomial, 2)) %>% as.data.frame()
+```
+
+*Reading this:* every language model — including ones from unrelated companies
+and older generations — repeats GPT-4's same-side misses far more often (60–78%)
+than an unrelated predictor would (about 29–31% under the corrected null,
+which is high only because of the shared yardstick). The human crowd, at 51%,
+is the *least* entangled predictor available. There is no independent second
+opinion on this list.
+
+## And domain experts? The second archive
+
+The authors' secondary archive holds 15 megastudies whose original teams
+collected forecasts from domain experts. The comparison-level file used here
+(`comparisons_archive2.csv`) was built from the authors' `megastudies.RDS` by
+our archive-2 script, following their own scale conversions and dataset
+corrections, with recalibration done within megastudy family. The question is
+the same: do experts miss where the model misses?
+
+```{r archive2}
+a2 <- read.csv(file.path(data_dir, "comparisons_archive2.csv"), check.names = FALSE)
+c(effects_total = nrow(a2), megastudies = n_distinct(a2$family))   # the full second archive
+a2 <- a2[!is.na(a2$z_recal_gpt) & !is.na(a2$z_recal_expert), ]   # conditions with expert forecasts
+
+gm2   <- abs(a2$z_recal_gpt)    > 1.96
+em2   <- abs(a2$z_recal_expert) > 1.96
+both2 <- gm2 & em2
+same2 <- both2 & (sign(a2$z_recal_gpt) == sign(a2$z_recal_expert))
+
+c(conditions            = nrow(a2),
+  gpt_miss              = round(mean(gm2), 3),
+  expert_miss           = round(mean(em2), 3),
+  expert_also_given_gpt = round(sum(both2) / sum(gm2), 3),
+  same_side_given_both  = round(sum(same2) / sum(both2), 3),
+  slope_expert_on_gpt   = round(coef(lm(a2$z_recal_expert ~ a2$z_recal_gpt))[2], 2))
+
+## the corrected-null benchmarks for these two shares:
+n2 <- null_exact(mean(gm2), mean(em2))
+c(null_expert_also_given_gpt = round(n2[["joint"]] / mean(gm2), 3),
+  null_same_side_given_both  = round(n2[["direction"]], 3))
+
+## the same reporting format as the primary archive: Wilson intervals for
+## every share, and a binomial P for the same-direction share against its
+## corrected-null benchmark
+same_dir2 <- gm2 & em2 & (sign(a2$z_recal_gpt) == sign(a2$z_recal_expert))
+bench2    <- n2[["same"]] / mean(gm2)   # same-direction share | GPT-4 miss, under the null
+rbind(gpt_miss              = c(mean(gm2),               wilson_ci(sum(gm2), length(gm2))),
+      expert_miss           = c(mean(em2),               wilson_ci(sum(em2), length(em2))),
+      expert_also_given_gpt = c(sum(both2) / sum(gm2),   wilson_ci(sum(both2), sum(gm2))),
+      same_side_given_both  = c(sum(same2) / sum(both2), wilson_ci(sum(same2), sum(both2))),
+      same_dir_given_gpt    = c(sum(same_dir2) / sum(gm2), wilson_ci(sum(same_dir2), sum(gm2)))
+) %>% `colnames<-`(c("share", "lo", "hi")) %>% round(3)
+c(null_same_dir_given_gpt = round(bench2, 3),
+  P_binomial = signif(pbinom(sum(same_dir2) - 1, sum(gm2), bench2, lower.tail = FALSE), 2))
+
+## the expert-on-model slope with its honest interval, clustered on the
+## megastudy family -- the same convention as the primary archive's slope
+sb2 <- slope_band(a2$z_recal_gpt, a2$z_recal_expert, a2$family)
+c(slope = round(sb2$slope, 2),
+  ci_lo = round(sb2$slope - 1.96 * sb2$slope_se, 2),
+  ci_hi = round(sb2$slope + 1.96 * sb2$slope_se, 2))
+```
+
+*Reading this:* on the 376 conditions with expert forecasts, experts miss about
+as often as the model (31.9% versus 30.3%); of the conditions GPT-4 misses,
+experts also miss 82%, and of the conditions both miss, 99% (92 of 93) are
+missed on the same side — against the corrected-null benchmark printed above,
+with a binomial P far below any conventional level. Expert error tracks model
+error with the slope and cluster-robust interval printed last. Expertise does
+not supply the independent second opinion either.
+
+# Where the shared misses fall
+
+**Why this section matters.** A user screening interventions or flagging
+effects for replication acts where the predictions look big and agreed. If
+shared misses were scattered at random they would be an accuracy tax; if they
+concentrate exactly where a user would act, they are a selection hazard.
+
+```{r concentration}
+big <- abs(wide$estimate) >= 0.05          # the authors' 5-percentage-point threshold
+tibble(`same-side rate | larger effects` = mean(same[big]),
+       `same-side rate | smaller effects` = mean(same[!big]),
+       n_larger = sum(big), n_smaller = sum(!big)) %>% round(3)
+
+mag  <- abs((wide$pg + wide$ph) / 2)       # size of the (uncorrected) average prediction
+gap  <- abs(wide$pg - wide$ph)             # how much the two disagree
+cell <- mag >= quantile(mag, .8) & sign(wide$pg) == sign(wide$ph) & gap <= median(gap)
+tibble(cell_n = sum(cell),
+       `same-side rate inside cell` = mean(same[cell]),
+       `same-side rate outside` = mean(same[!cell])) %>% round(3)
+
+## each split with Wilson intervals on both sides and a two-proportion test,
+## so the "three times as common" sentences can carry their own statistics
+split_stats <- function(flag) {
+  k1 <- sum(same[flag]);  n1 <- sum(flag)
+  k0 <- sum(same[!flag]); n0 <- sum(!flag)
+  c(inside = k1 / n1, wilson_ci(k1, n1),
+    outside = k0 / n0, setNames(wilson_ci(k0, n0), c("lo ", "hi ")),
+    P = prop.test(c(k1, k0), c(n1, n0))$p.value)
+}
+rbind(`larger vs smaller effects`   = split_stats(big),
+      `screening cell vs remainder` = split_stats(cell)) %>% signif(3)
+
+## and the direction of the shared errors:
+mean(sign(wide$zg[same]) != sign(wide$estimate[same]))   # share erring toward zero
+
+## how widely the shared misses are spread across the 70 studies
+c(studies_with_joint_miss = n_distinct(wide$study[joint]),
+  studies_with_same_side  = n_distinct(wide$study[same]))
+```
+
+*Reading this:* the misses are ~3x as common among the larger observed effects
+(27.9% vs 10.3%), and in the "looks most trustworthy" cell — big predicted
+effect, both predictors agreeing closely in sign and size — 56% of comparisons
+are same-side misses. And 82% of all same-side misses have both predictors
+erring toward zero: shared conservatism about large effects.
+
+# Robustness: none of this depends on our choices
+
+Three alternative analyses, same conclusion. (1) No recalibration at all.
+(2) A more flexible, monotone ("isotonic") recalibration instead of the linear
+one — fitted with the same leave-one-study-out scheme. (3) Different cut-offs
+for what counts as a miss.
+
+```{r robustness, cache=TRUE}
+iso_loo <- function(pred, est, study) {
+  out <- rep(NA_real_, length(pred))
+  for (s in unique(study)) {
+    tr <- study != s
+    fit <- isoreg(pred[tr], est[tr])
+    f <- approxfun(sort(fit$x), fit$yf, method = "linear", rule = 2)
+    out[!tr] <- f(pred[!tr])
+  }
+  out
+}
+zg_iso <- (iso_loo(wide$pg, wide$estimate, wide$study) - wide$estimate) / wide$std.error
+zh_iso <- (iso_loo(wide$ph, wide$estimate, wide$study) - wide$estimate) / wide$std.error
+
+summ <- function(a, b, thr = 1.96) {
+  j <- abs(a) > thr & abs(b) > thr; s <- j & sign(a) == sign(b)
+  nulls <- null_exact(mean(abs(a) > thr), mean(abs(b) > thr), t = thr)
+  tibble(miss_g = mean(abs(a) > thr), miss_h = mean(abs(b) > thr),
+         joint = mean(j), null_joint = nulls[["joint"]],
+         same_side = mean(s), null_same = nulls[["same"]],
+         direction = sum(s)/sum(j), null_direction = nulls[["direction"]])
+}
+bind_rows(
+  `no recalibration`      = summ(wide$`z_raw_gpt-4`, wide$z_raw_human),
+  `linear recalibration`  = summ(wide$zg, wide$zh),
+  `isotonic recalibration`= summ(zg_iso, zh_iso),
+  `linear, threshold 1.64`= summ(wide$zg, wide$zh, 1.64),
+  `linear, threshold 2.58`= summ(wide$zg, wide$zh, 2.58),
+  `linear, threshold 3.29`= summ(wide$zg, wide$zh, 3.29),
+  .id = "analysis") %>% mutate(across(where(is.numeric), ~round(., 3))) %>% as.data.frame()
+
+## the analysis set behind the 1,678, and a rank-based coupling measure
+c(studies = n_distinct(wide$study),
+  study_outcome_cells = wide %>% distinct(study, outcome.name) %>% nrow(),
+  spearman_zg_zh = round(cor(wide$zg, wide$zh, method = "spearman"), 2))
+```
+
+```{r pp-corr}
+er_g <- wide$zg * wide$std.error; er_h <- wide$zh * wide$std.error   # recalibrated errors, pp scale
+c(recalibrated = round(cor(er_g, er_h), 2),
+  uncorrected  = round(cor(wide$pg - wide$estimate, wide$ph - wide$estimate), 2))
+```
+
+# Does it hold under the authors' own sampling scheme?
+
+**Why ask.** We analyse all 1,678 available comparisons. The authors instead
+draw one outcome and one reference condition per study, compare every other
+condition against that reference, and repeat the whole draw 32 times. A referee
+will reasonably ask whether our result depends on using the full set.
+
+**The check.** Reproduce their scheme exactly and recompute the two headline
+rates, once with their 32 draws and once with many more draws so the spread is
+stable.
+
+```{r authors-sampling, cache=TRUE}
+set.seed(22)
+idx_by_study <- split(seq_len(nrow(wide)), wide$study)
+
+one_draw <- function() {
+  keep <- unlist(lapply(idx_by_study, function(ii) {
+    ocs <- unique(wide$outcome.name[ii])
+    oc  <- ocs[sample.int(length(ocs), 1)]              # one outcome per study
+    jj  <- ii[wide$outcome.name[ii] == oc]
+    cds <- unique(c(wide$reference_condition[jj], wide$condition.name[jj]))
+    ref <- cds[sample.int(length(cds), 1)]              # one reference condition
+    jj[wide$reference_condition[jj] == ref | wide$condition.name[jj] == ref]
+  }), use.names = FALSE)
+  g <- wide$zg[keep]; h <- wide$zh[keep]
+  j <- abs(g) > 1.96 & abs(h) > 1.96
+  c(n = length(keep), joint = mean(j), same = mean(j & sign(g) == sign(h)))
+}
+
+draws32  <- t(replicate(32,  one_draw()))
+draws500 <- t(replicate(500, one_draw()))
+
+rbind(
+  `all 1,678 comparisons`       = c(NA, mean(joint), mean(same)),
+  `their scheme, 32 draws`      = c(median(draws32[,  "n"]),
+                                    median(draws32[,  "joint"]), median(draws32[,  "same"])),
+  `their scheme, 500 draws`     = c(median(draws500[, "n"]),
+                                    median(draws500[, "joint"]), median(draws500[, "same"]))
+) %>% `colnames<-`(c("effects_per_draw", "joint", "same_side")) %>% round(3)
+
+## spread across draws (a sensitivity check, not a confidence interval —
+## the confidence intervals in the commentary come from the study bootstrap above)
+apply(draws500[, c("joint", "same")], 2,
+      function(x) c(sd = sd(x), lo = quantile(x, .025), hi = quantile(x, .975))) %>% round(3)
+```
+
+*Reading this:* under the authors' own sampling the joint-miss rate is about
+23% and the same-side rate about 20% — both slightly **higher** than in the
+full set (20.2% and 18.2%), and both well clear of their corrected nulls. The
+finding is therefore not an artefact of analysing every available comparison.
+
+Two notes. A draw yields about 235 unordered pairs, which is the authors'
+reported 469 effects counted in both orientations: comparing every condition to
+the reference produces one contrast per pair, and 305 conditions across 70
+studies leaves 235 such pairs. The rates are unaffected by orientation anyway,
+because flipping a pair flips the sign of the observed effect and of both
+predictions together, leaving every |z| and every sign agreement unchanged.
+Second, the spread across draws reported here measures sensitivity to their
+sampling step; the uncertainty intervals quoted in the commentary continue to
+come from the study-level bootstrap, which is the appropriate one.
+
+# The figures as they appear in the commentary
+
+The three main-text scatter/bar figures are produced by the matplotlib routine
+below --- the exact code used to render the figures in the manuscript. Every
+scatter (Fig. 1a, the Fig. 2 small multiples and Fig. 3a) carries the same four
+corner annotations: the opposite-direction, both-overshoot and both-undershoot
+counts, and the cluster-robust error-on-error slope with its 95% interval. The
+routine reads the derived comparison tables written by the pipeline
+(`data/derived/`), so the numbers in the figures and the numbers in the text
+cannot drift apart.
+
+This section runs Python (pandas, numpy, matplotlib) through **reticulate**;
+knitting it therefore requires those packages on a Python that reticulate can
+find. The figures are written to `output/figures/` as `fig1.png` (GPT-4 vs the
+human crowd), `fig2.png` (each other predictor vs GPT-4) and `fig3.png` (GPT-4
+vs domain experts).
+
+```{r figure-paths}
+library(reticulate)
+ALL_MODELS_CSV <- here::here("data", "derived", "comparisons_all_models.csv")
+ARCHIVE2_CSV   <- here::here("data", "derived", "comparisons_archive2.csv")
+OUTDIR         <- here::here("output", "figures")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{python figures, results='hide'}
+#!/usr/bin/env python3
+"""
+Shared-error reanalysis - main figures.
+Fig. 1  GPT-4 vs human crowd (primary archive):   a scatter, b same-way share, c direction split
+Fig. 3  GPT-4 vs domain experts (secondary archive): same template
+Fig. 2  Each predictor's error vs GPT-4's (primary archive), small multiples
+
+Run:  python3 make_figures.py     (outputs land in ./figures next to this script)
+Requires: pandas, numpy, matplotlib
+"""
+import os, math
+import pandas as pd, numpy as np, matplotlib as mpl
+mpl.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
+from matplotlib.gridspec import GridSpec
+from statistics import NormalDist
+trapz = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
+
+# ============================ CONFIG ============================
+ALL_MODELS_CSV = r.ALL_MODELS_CSV
+ARCHIVE2_CSV   = r.ARCHIVE2_CSV
+OUTDIR         = r.OUTDIR
+BOOT           = 2000        # bootstrap reps for observed-rate / slope CIs
+BOOT_NULL      = 400         # bootstrap reps for null CIs (each recomputes the integral)
+# ================================================================
+
+os.makedirs(OUTDIR, exist_ok=True)
+N = NormalDist()
+T = 1.96; CLIP = 12; VIEW = 13.4
+
+mpl.rcParams.update({"font.family":"DejaVu Sans","font.size":9.5,"axes.edgecolor":"#9AA1A9",
+    "axes.linewidth":0.8,"xtick.color":"#4A525B","ytick.color":"#4A525B",
+    "text.color":"#222222","axes.labelcolor":"#222222"})
+
+RED   = "#A93B2B"   # same-side points / observed bars
+BLUE  = "#4C6FA1"   # opposite-side points
+LBLUE = "#A9BFD8"   # opposite-direction bar
+GRAYP = "#C9CCD1"   # non-joint-miss points
+GRAY1 = "#ABABAB"   # corrected-null bar
+GRAY2 = "#D7D7D7"   # naive-null bar
+INK   = "#222222"
+FILL  = "#F6ECEA"   # quadrant shading
+
+clip = lambda v: np.clip(v, -CLIP, CLIP)
+_erf = np.vectorize(math.erf)
+def Phi(x): return 0.5*(1.0+_erf(np.asarray(x,dtype=float)/1.4142135623730951))
+
+def null_exact(miss_g, miss_h, t=T, ngrid=1201):
+    """Corrected null (vectorized): joint-miss rate, same-side rate, direction share
+    for two independent predictors scored against the same noisy estimate."""
+    if miss_g <= 0 or miss_h <= 0: return {"joint":0.0,"same":0.0,"direction":0.5}
+    sig = lambda p: t/N.inv_cdf(1-p/2)
+    s2g = max(sig(miss_g)**2-1, 0); s2h = max(sig(miss_h)**2-1, 0)
+    u = np.linspace(-9, 9, ngrid); phi = np.exp(-u*u/2)/math.sqrt(2*math.pi)
+    def hi(s2): return 1-Phi((t+u)/math.sqrt(s2)) if s2 > 0 else (-u > t).astype(float)
+    def lo(s2): return Phi((-t+u)/math.sqrt(s2)) if s2 > 0 else (-u < -t).astype(float)
+    gh, gl, hh, hl = hi(s2g), lo(s2g), hi(s2h), lo(s2h)
+    joint = trapz((gh+gl)*(hh+hl)*phi, u)
+    same  = trapz((gh*hh+gl*hl)*phi, u)
+    return {"joint":joint, "same":same, "direction":same/joint}
+
+def cluster_groups(c):
+    uq = np.unique(c); return [np.where(c == k)[0] for k in uq]
+
+def slope_ci(x, y, c, B=BOOT):
+    np.random.seed(42)
+    b = ((x-x.mean())*(y-y.mean())).sum()/((x-x.mean())**2).sum()
+    groups = cluster_groups(c); K = len(groups); est = []
+    for _ in range(B):
+        idx = np.concatenate([groups[j] for j in np.random.randint(0, K, K)])
+        xi, yi = x[idx], y[idx]; d = ((xi-xi.mean())**2).sum()
+        if d > 0: est.append(((xi-xi.mean())*(yi-yi.mean())).sum()/d)
+    return b, *np.percentile(est, [2.5, 97.5])
+
+def boot_stats(x, y, c, B=BOOT, Bn=BOOT_NULL):
+    """Cluster bootstrap CIs for: same-way share (of all), direction share (of joint),
+    and the two null benchmarks in panel b."""
+    np.random.seed(42)
+    groups = cluster_groups(c); K = len(groups)
+    sw, dr, cn, nn = [], [], [], []
+    for i in range(B):
+        idx = np.concatenate([groups[j] for j in np.random.randint(0, K, K)])
+        xg, yg = x[idx], y[idx]
+        gm = np.abs(xg) > T; hm = np.abs(yg) > T; both = gm & hm
+        same = both & (np.sign(xg) == np.sign(yg))
+        sw.append(same.mean())
+        if both.sum() > 0: dr.append(same.sum()/both.sum())
+        if i < Bn and gm.mean() > 0 and hm.mean() > 0:
+            ne = null_exact(gm.mean(), hm.mean(), ngrid=601)
+            cn.append(ne["same"]); nn.append(gm.mean()*hm.mean()*0.5)
+    pct = lambda a: (100*np.percentile(a, 2.5), 100*np.percentile(a, 97.5))
+    return pct(sw), pct(dr), pct(cn), pct(nn)
+
+# ---------------- the Fig-1 template (used for Fig. 1 and Fig. 3) ----------------
+def panel_fig(x, y, c, other_name, unit_word, title_a, outpath):
+    n = len(x)
+    gm = np.abs(x) > T; hm = np.abs(y) > T; both = gm & hm
+    same = both & (np.sign(x) == np.sign(y)); oppo = both & ~same
+    over  = same & (x > T); under = same & (x < -T)
+    n_joint, n_same, n_oppo = int(both.sum()), int(same.sum()), int(oppo.sum())
+    ne = null_exact(gm.mean(), hm.mean())
+    obs_b  = 100*same.mean();  corr_b = 100*ne["same"];  naive_b = 100*gm.mean()*hm.mean()*0.5
+    obs_c  = 100*n_same/n_joint; oppo_c = 100*n_oppo/n_joint; corr_c = 100*ne["direction"]
+    ci_sw, ci_dr, ci_cn, ci_nn = boot_stats(x, y, c)
+    ci_op = (100-ci_dr[1], 100-ci_dr[0])
+
+    fig = plt.figure(figsize=(11.7, 6.6), constrained_layout=True)
+    gs = GridSpec(2, 2, figure=fig, width_ratios=[1.5, 1], height_ratios=[1, 1])
+    axa = fig.add_subplot(gs[:, 0]); axb = fig.add_subplot(gs[0, 1]); axc = fig.add_subplot(gs[1, 1])
+
+    # ---- a: scatter ----
+    axa.add_patch(Rectangle((T, T), VIEW-T, VIEW-T, facecolor=FILL, edgecolor="none", zorder=0))
+    axa.add_patch(Rectangle((-VIEW, -VIEW), VIEW-T, VIEW-T, facecolor=FILL, edgecolor="none", zorder=0))
+    axa.axhline(0, color="#B9BDC2", lw=.8, zorder=1); axa.axvline(0, color="#B9BDC2", lw=.8, zorder=1)
+    for s in (T, -T):
+        axa.axhline(s, color="#7A828B", lw=.8, ls=(0, (4, 3)), zorder=1)
+        axa.axvline(s, color="#7A828B", lw=.8, ls=(0, (4, 3)), zorder=1)
+    oth = ~both
+    axa.scatter(clip(x[oth]),  clip(y[oth]),  s=5,  c=GRAYP, alpha=.6, lw=0, zorder=2)
+    axa.scatter(clip(x[oppo]), clip(y[oppo]), s=11, c=BLUE,  alpha=.9, lw=0, zorder=3)
+    axa.scatter(clip(x[same]), clip(y[same]), s=11, c=RED,   alpha=.9, lw=0, zorder=4)
+    b, lo, hi = slope_ci(x, y, c); a0 = y.mean()-b*x.mean()
+    xx = np.linspace(-CLIP, CLIP, 50)
+    axa.fill_between(xx, a0+lo*xx, a0+hi*xx, color="#666666", alpha=.18, lw=0, zorder=5)
+    axa.plot(xx, a0+b*xx, color="#1A1A1A", lw=1.6, zorder=6)
+    axa.text(-VIEW+0.7,  VIEW-0.8, f"opposite directions\n{n_oppo}",  color=BLUE, fontsize=9, va="top")
+    axa.text( VIEW-0.7,  VIEW-0.8, f"both overshoot\n{int(over.sum())}",  color=RED, fontsize=9, va="top", ha="right")
+    axa.text(-VIEW+0.7, -VIEW+0.8, f"both undershoot\n{int(under.sum())}", color=RED, fontsize=9, va="bottom")
+    axa.text( VIEW-0.7, -VIEW+0.8, f"slope {b:.2f}\n[{lo:.2f}, {hi:.2f}]", color=INK, fontsize=9, va="bottom", ha="right")
+    axa.set_xlim(-VIEW, VIEW); axa.set_ylim(-VIEW, VIEW); axa.set_aspect("equal")
+    axa.set_xticks([-10, -5, 0, 5, 10]); axa.set_yticks([-10, -5, 0, 5, 10])
+    axa.set_xlabel("GPT-4 forecasting error\n(standard errors of the observed effect)", fontsize=9.5)
+    axa.set_ylabel(f"{other_name} forecasting error\n(standard errors of the observed effect)", fontsize=9.5)
+    axa.set_title(title_a, fontsize=10.5, pad=10)
+    for sp in ("top", "right"): axa.spines[sp].set_visible(False)
+    axa.text(-0.16, 1.03, "a", transform=axa.transAxes, fontsize=14, fontweight="bold")
+
+    # ---- b: same-way share of all ----
+    xs = [0, 1, 2]; vals = [obs_b, corr_b, naive_b]; cols = [RED, GRAY1, GRAY2]
+    cis = [ (obs_b, *ci_sw), (corr_b, *ci_cn), (naive_b, *ci_nn) ]
+    axb.grid(axis="y", color="#DDDDDD", lw=.7, zorder=0)
+    axb.bar(xs, vals, width=.6, color=cols, zorder=2)
+    for xpos, (v, l, h) in zip(xs, cis):
+        axb.errorbar(xpos, v, yerr=[[max(v-l, 0)], [max(h-v, 0)]], fmt="none",
+                     ecolor=INK, elinewidth=1.0, capsize=3, zorder=3)
+        axb.text(xpos, h+0.9, f"{v:.1f}%", ha="center", fontsize=9.5, fontweight="bold")
+    axb.set_xticks(xs)
+    axb.set_xticklabels(["Observed", "Corrected null", "Null ignoring\nshared estimate"], fontsize=8.5)
+    top = max(ci_sw[1], obs_b)*1.35
+    axb.set_ylim(0, top); axb.set_yticks([0, 10, 20] if top < 30 else [0, 10, 20, 30])
+    axb.set_yticklabels([f"{t:.0f}%" if t else "0" for t in axb.get_yticks()])
+    axb.set_title(f"Share of all {n:,} {unit_word}\nthat both predictors miss the same way",
+                  fontsize=10, loc="left", pad=8)
+    for sp in ("top", "right"): axb.spines[sp].set_visible(False)
+    axb.text(-0.14, 1.12, "b", transform=axb.transAxes, fontsize=14, fontweight="bold")
+
+    # ---- c: direction split among joint misses ----
+    axc.grid(axis="y", color="#DDDDDD", lw=.7, zorder=0)
+    axc.bar([0, 1], [obs_c, oppo_c], width=.55, color=[RED, LBLUE], zorder=2)
+    for xpos, v, (l, h) in [(0, obs_c, ci_dr), (1, oppo_c, ci_op)]:
+        axc.errorbar(xpos, v, yerr=[[max(v-l, 0)], [max(h-v, 0)]], fmt="none",
+                     ecolor=INK, elinewidth=1.0, capsize=3, zorder=3)
+        axc.text(xpos, h+3.5, f"{v:.0f}%", ha="center", fontsize=9.5, fontweight="bold")
+    axc.axhline(corr_c, color=INK, lw=1.2, ls=(0, (5, 2)), zorder=4)
+    axc.text(1.42, corr_c+2, f"corrected null, {corr_c:.0f}%", fontsize=8.5, ha="right", color=INK)
+    axc.axhline(50, color="#9AA1A9", lw=1.0, ls=(0, (1, 2)), zorder=4)
+    axc.text(1.42, 52, "chance, 50%", fontsize=8.5, ha="right", color="#9AA1A9")
+    axc.set_xticks([0, 1]); axc.set_xticklabels(["Same\ndirection", "Opposite\ndirections"], fontsize=8.5)
+    axc.set_xlim(-.55, 1.55); axc.set_ylim(0, 118); axc.set_yticks([0, 50, 100])
+    axc.set_yticklabels(["0", "50%", "100%"])
+    axc.set_title(f"Of the {n_joint} {unit_word} both miss,\nthe share missed in the same direction",
+                  fontsize=10, loc="left", pad=8)
+    for sp in ("top", "right"): axc.spines[sp].set_visible(False)
+    axc.text(-0.14, 1.12, "c", transform=axc.transAxes, fontsize=14, fontweight="bold")
+
+    fig.savefig(outpath, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"{os.path.basename(outpath)}: slope {b:.2f} [{lo:.2f},{hi:.2f}] | same-way {obs_b:.1f}% "
+          f"(nulls {corr_b:.1f}/{naive_b:.1f}) | direction {obs_c:.0f}% (null {corr_c:.0f})")
+
+# ---------------- Fig 2: small-multiple scatters (unchanged style) ----------------
+def scatter_small(ax, x, y, c, title, xlab):
+    gm = np.abs(x) > T; em = np.abs(y) > T; both = gm & em
+    same = both & (np.sign(x) == np.sign(y)); oppo = both & ~same; oth = ~both
+    over = same & (x > T); under = same & (x < -T)
+    ax.axhline(0, color="#DfE3E7", lw=.6); ax.axvline(0, color="#DfE3E7", lw=.6)
+    for s in (T, -T):
+        ax.axhline(s, color="#7A828B", lw=.6, ls=(0, (4, 3))); ax.axvline(s, color="#7A828B", lw=.6, ls=(0, (4, 3)))
+    ax.scatter(clip(x[oth]),  clip(y[oth]),  s=5,  c=GRAYP, alpha=.55, lw=0)
+    ax.scatter(clip(x[oppo]), clip(y[oppo]), s=7,  c=BLUE,  alpha=.85, lw=0)
+    ax.scatter(clip(x[same]), clip(y[same]), s=7,  c=RED,   alpha=.85, lw=0)
+    b, lo, hi = slope_ci(x, y, c, B=800); a0 = y.mean()-b*x.mean(); xx = np.linspace(-CLIP, CLIP, 40)
+    ax.fill_between(xx, a0+lo*xx, a0+hi*xx, color="#666666", alpha=.16, lw=0)
+    ax.plot(xx, a0+b*xx, color="#1A1A1A", lw=1.3)
+    ax.text(-VIEW+0.6,  VIEW-0.6, f"opposite\n{int(oppo.sum())}", color=BLUE, fontsize=5.8, va="top", ha="left", linespacing=.9)
+    ax.text( VIEW-0.6,  VIEW-0.6, f"both over\n{int(over.sum())}", color=RED, fontsize=5.8, va="top", ha="right", linespacing=.9)
+    ax.text(-VIEW+0.6, -VIEW+0.6, f"both under\n{int(under.sum())}", color=RED, fontsize=5.8, va="bottom", ha="left", linespacing=.9)
+    ax.text( VIEW-0.6, -VIEW+0.6, f"slope {b:.2f}\n[{lo:.2f}, {hi:.2f}]", color=INK, fontsize=5.8, va="bottom", ha="right", linespacing=.9)
+    ax.set_xlim(-VIEW, VIEW); ax.set_ylim(-VIEW, VIEW); ax.set_aspect("equal")
+    ax.set_xticks([-10, 0, 10]); ax.set_yticks([-10, 0, 10])
+    ax.set_title(title, loc="left", fontweight="bold", fontsize=9.5)
+    ax.set_ylabel("forecasting error (SEs)", fontsize=8)
+    if xlab: ax.set_xlabel("GPT-4 forecasting error (SEs)", fontsize=8)
+    for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+
+# ============================ DATA ============================
+am = pd.read_csv(ALL_MODELS_CSV)
+key = ["study", "outcome.name", "reference_condition", "condition.name"]
+wide = am.pivot_table(index=key, columns="model", values="z_recal", aggfunc="first").reset_index()
+g = wide["gpt-4"].values; cl = wide["study"].values
+
+# ---- Fig 1 ----
+h = wide["human"].values; ok = ~(np.isnan(g) | np.isnan(h))
+panel_fig(g[ok], h[ok], cl[ok], "Human", "comparisons",
+          "The two predictors' errors line up, comparison by comparison",
+          os.path.join(OUTDIR, "fig1.png"))
+
+# ---- Fig 2 ----
+models = [("deepseek/deepseek-chat-v3-0324", "DeepSeek-V3"), ("openai/gpt-oss-120b", "GPT-OSS-120B"),
+          ("gpt-3.5-turbo", "GPT-3.5"), ("google/gemma-3-27b-it", "Gemma-3-27B"),
+          ("babbage-002", "babbage-002"), ("davinci-002", "davinci-002")]
+letters = "abcdef"
+fig, axs = plt.subplots(2, 4, figsize=(12.4, 6.9), constrained_layout=True); axs = axs.ravel()
+for i, (mc, nm) in enumerate(models):
+    zo = wide[mc].values; ok = ~(np.isnan(g) | np.isnan(zo))
+    scatter_small(axs[i], g[ok], zo[ok], cl[ok], f"{letters[i]}   {nm}", xlab=(i >= 2))
+axs[6].axis("off"); axs[7].axis("off")
+LEG = [Line2D([], [], marker='o', ls='', mfc=RED,   mec='none', label='both miss, same side'),
+       Line2D([], [], marker='o', ls='', mfc=BLUE,  mec='none', label='both miss, opposite side'),
+       Line2D([], [], marker='o', ls='', mfc=GRAYP, mec='none', label='not a joint miss'),
+       Line2D([], [], color="#1A1A1A", lw=1.6, label='fitted slope (95% CI)')]
+axs[6].legend(handles=LEG, loc="center", frameon=False, fontsize=9,
+              title="each point = one of 1,678 comparisons", title_fontsize=9)
+fig.savefig(os.path.join(OUTDIR, "fig2.png"), dpi=160, bbox_inches="tight")
+plt.close(fig)
+print("fig2.png: done")
+
+# ---- Fig 3 ----
+a2 = pd.read_csv(ARCHIVE2_CSV).dropna(subset=["z_recal_gpt", "z_recal_expert"])
+panel_fig(a2["z_recal_gpt"].values, a2["z_recal_expert"].values, a2["family"].values,
+          "Expert", "conditions",
+          "The two predictors' errors line up, condition by condition",
+          os.path.join(OUTDIR, "fig3.png"))
+print("done: fig1.png, fig2.png, fig3.png")
+```
+
+```{r figure-show, echo=FALSE, out.width='100%', fig.align='center'}
+knitr::include_graphics(file.path(OUTDIR, c("fig1.png", "fig2.png", "fig3.png")))
+```
+
+
+# How strongly are the two errors coupled, study by study?
+
+```{r heterogeneity}
+fit <- lm(zh ~ zg, data = wide)
+## cluster-robust (by study) standard error, computed by hand:
+X <- model.matrix(fit); u <- residuals(fit)
+XtXi <- solve(crossprod(X))
+meat <- Reduce(`+`, lapply(split(seq_len(nrow(X)), wide$study), function(i) {
+  v <- crossprod(X[i, , drop = FALSE], u[i]); tcrossprod(v)
+}))
+se_cl <- sqrt(diag(XtXi %*% meat %*% XtXi))[2]
+se_iid <- summary(fit)$coefficients[2, 2]
+c(slope = round(coef(fit)[2], 2),
+  cluster_ci_lo = round(coef(fit)[2] - 1.96 * se_cl, 2),
+  cluster_ci_hi = round(coef(fit)[2] + 1.96 * se_cl, 2),
+  iid_ci_lo = round(coef(fit)[2] - 1.96 * se_iid, 2),
+  iid_ci_hi = round(coef(fit)[2] + 1.96 * se_iid, 2))
+
+## share of the co-error's variance lying between studies (one-way ANOVA)
+w <- wide$zg * wide$zh
+gm <- mean(w)
+ssb <- sum(tapply(w, wide$study, function(x) length(x) * (mean(x) - gm)^2))
+round(100 * ssb / sum((w - gm)^2), 1)
+
+slopes <- wide %>% group_by(study) %>% filter(n() >= 5, sd(zg) > 0) %>%
+  summarise(slope = coef(lm(zh ~ zg))[2])
+c(n_studies = nrow(slopes), median = round(median(slopes$slope), 2),
+  q25 = round(quantile(slopes$slope, .25), 2), q75 = round(quantile(slopes$slope, .75), 2))
+```
+
+*Reading this:* on average, when GPT-4's error grows by one standard error, the
+crowd's grows by about half of one (slope 0.46) — and the honest confidence
+interval, which treats studies rather than comparisons as the unit, is
+0.30–0.62. The per-study slopes show the coupling is everywhere but uneven.
+
+# Session information
+
+```{r session}
+sessionInfo()
+```

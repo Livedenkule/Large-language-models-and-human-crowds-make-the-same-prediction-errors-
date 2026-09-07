@@ -1,0 +1,7 @@
+"analysis","miss_g","miss_h","joint","null_joint","same_side","null_same","direction","null_direction"
+"No recalibration, 1.96",0.463,0.498,0.276,0.232,0.209,0.141,0.758,0.608
+"Linear recalibration, 1.96",0.357,0.38,0.202,0.141,0.182,0.1,0.9,0.712
+"Isotonic recalibration, 1.96",0.381,0.352,0.22,0.14,0.191,0.1,0.87,0.714
+"Linear, threshold 1.64",0.413,0.443,0.25,0.189,0.223,0.134,0.893,0.71
+"Linear, threshold 2.58",0.246,0.274,0.117,0.071,0.108,0.053,0.919,0.739
+"Linear, threshold 3.29",0.169,0.186,0.07,0.034,0.066,0.026,0.94,0.755
