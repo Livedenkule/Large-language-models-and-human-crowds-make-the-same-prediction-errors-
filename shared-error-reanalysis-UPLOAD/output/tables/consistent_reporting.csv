@@ -1,9 +1,0 @@
-"analysis","predictor","n_overlap","n_gpt4_misses","repeats_same_dir","wilson_lo","wilson_hi","corrected_null","p_binomial"
-"primary: vs GPT-4 misses","deepseek/deepseek-chat-v3-0324",1678,599,0.783,0.748,0.814,0.288,9.23e-139
-"primary: vs GPT-4 misses","openai/gpt-oss-120b",1678,599,0.756,0.72,0.789,0.297,8.92e-119
-"primary: vs GPT-4 misses","gpt-3.5-turbo",1678,599,0.669,0.631,0.706,0.295,1.63e-79
-"primary: vs GPT-4 misses","google/gemma-3-27b-it",1678,599,0.643,0.604,0.68,0.286,6.24e-73
-"primary: vs GPT-4 misses","babbage-002",1678,599,0.623,0.583,0.661,0.291,2.48e-63
-"primary: vs GPT-4 misses","davinci-002",1678,599,0.599,0.56,0.638,0.309,1.34e-48
-"primary: vs GPT-4 misses","human",1678,599,0.509,0.469,0.549,0.281,4.9e-32
-"secondary: vs GPT-4 misses","domain experts",376,114,0.807,0.725,0.869,0.274,3.39e-32
